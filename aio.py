@@ -25,7 +25,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 REPO = "Solevaral/All-in-one-for-linux"
 CATALOG_URL = "https://raw.githubusercontent.com/Solevaral/All-in-one-modules/main/catalog.json"
 USER_AGENT = f"AllInOne-Linux/{VERSION}"
@@ -771,7 +771,9 @@ def autoupdate(enable: bool) -> None:
                           "[Timer]\nOnBootSec=5min\nOnUnitActiveSec=1d\nPersistent=true\n\n"
                           "[Install]\nWantedBy=timers.target\n")
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-        subprocess.run(["systemctl", "--user", "enable", "--now", f"{UPDATE_UNIT}.timer"], check=False)
+        res = subprocess.run(["systemctl", "--user", "enable", "--now", f"{UPDATE_UNIT}.timer"], check=False)
+        if res.returncode != 0:
+            raise AioError("systemd не включил таймер автообновления (systemctl --user недоступен?)")
         info("Автообновление включено: раз в день, при обновлении — уведомление.")
     else:
         subprocess.run(["systemctl", "--user", "disable", "--now", f"{UPDATE_UNIT}.timer"],
