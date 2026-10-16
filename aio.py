@@ -25,7 +25,7 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 REPO = "Solevaral/All-in-one-for-linux"
 CATALOG_URL = "https://raw.githubusercontent.com/Solevaral/All-in-one-modules/main/catalog.json"
 USER_AGENT = f"AllInOne-Linux/{VERSION}"
@@ -102,12 +102,166 @@ class AioError(Exception):
 
 # --------------------------------------------------------------------------- вывод
 
-COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+# Оформление (цвета, значки, рамки, очистка экрана) — только когда поток идёт в терминал.
+# В pipe, лог и журнал systemd вывод остаётся простым текстом прежнего вида, без ANSI.
+
+def _tty(stream) -> bool:
+    try:
+        return stream.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+_DUMB = os.environ.get("TERM") == "dumb"
+_NO_COLOR = os.environ.get("NO_COLOR") is not None
+SCREEN = _tty(sys.stdout) and not _DUMB              # можно очищать экран и рисовать прогресс
+COLOR = SCREEN and not _NO_COLOR
+ERR_COLOR = _tty(sys.stderr) and not _DUMB and not _NO_COLOR
+FANCY = SCREEN and "utf" in (sys.stdout.encoding or "").lower()   # рамки и значки Unicode
 QUIET = False
 
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
 
-def _c(code: str, text: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if COLOR else text
+# Состояние модуля → (значок, запасной ASCII-значок, цвет).
+TONES = {
+    "run": ("●", "*", "32"),     # работает
+    "idle": ("○", "o", "36"),    # установлен, не запущен
+    "warn": ("▲", "!", "33"),    # нужна настройка / таймер взведён
+    "bad": ("✗", "x", "31"),     # служба упала
+    "off": ("·", ".", "2"),      # не установлен
+    "na": ("–", "-", "2"),       # нет версии для Linux
+    "builtin": ("◆", "+", "35"),  # встроенный
+}
+LEGEND = {"run": "работает", "idle": "установлен", "warn": "внимание", "bad": "ошибка",
+          "off": "не установлен", "na": "нет для Linux", "builtin": "встроен"}
+
+
+def _c(code: str, text: str, on: bool | None = None) -> str:
+    if on is None:
+        on = COLOR
+    return f"\033[{code}m{text}\033[0m" if on and text else text
+
+
+def bold(t: str) -> str:
+    return _c("1", t)
+
+
+def dim(t: str) -> str:
+    return _c("2", t)
+
+
+def accent(t: str) -> str:
+    return _c("1;36", t)
+
+
+def glyph(tone: str) -> str:
+    fancy, plain, color = TONES[tone]
+    return _c(color, fancy if FANCY else plain)
+
+
+def text_width(s: str) -> int:
+    """Ширина строки в колонках терминала: без ANSI, с учётом широких символов."""
+    import unicodedata
+    w = 0
+    for ch in ANSI_RE.sub("", s):
+        if unicodedata.combining(ch):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def pad(s: str, width: int) -> str:
+    return s + " " * max(0, width - text_width(s))
+
+
+def clip(s: str, width: int) -> str:
+    """Обрезает простой (без ANSI) текст до ширины, ставя многоточие."""
+    if text_width(s) <= width:
+        return s
+    out = ""
+    for ch in s:
+        if text_width(out + ch) > width - 1:
+            break
+        out += ch
+    return out + ("…" if FANCY else "~")
+
+
+def term_width() -> int:
+    return max(56, min(shutil.get_terminal_size((80, 24)).columns, 96))
+
+
+def wrap(text: str, width: int) -> list[str]:
+    import textwrap
+    return textwrap.wrap(text, max(20, width), break_on_hyphens=False) or [""]
+
+
+def clear_screen() -> None:
+    # Альтернативный экран, как у полноэкранных утилит: меню не копится в прокрутке,
+    # а после выхода в терминале остаётся то, что было до запуска aio.
+    # Повторяем ?1049h каждый раз: TUI zapret-rust при выходе сам покидает этот экран.
+    if SCREEN:
+        sys.stdout.write("\033[?1049h\033[H\033[2J")
+        sys.stdout.flush()
+
+
+def leave_screen() -> None:
+    if SCREEN:
+        sys.stdout.write("\033[?1049l")
+        sys.stdout.flush()
+
+
+def rule(width: int | None = None) -> str:
+    return dim(("─" if FANCY else "-") * (width or term_width()))
+
+
+def box(title: str, lines: list[str], right: str = "") -> None:
+    """Рамка с заголовком в верхней границе: ╭─ Заголовок ───── справа ─╮."""
+    w = term_width()
+    h, v = ("─", "│") if FANCY else ("-", "|")
+    tl, tr, bl, br = ("╭", "╮", "╰", "╯") if FANCY else ("+", "+", "+", "+")
+    head = f"{h} {title} "
+    tail = f" {right} {h}" if right else h
+    fill = max(1, w - 2 - text_width(head) - text_width(tail))
+    print(_c("36", tl + h) + " " + bold(title) + " " + _c("36", h * fill)
+          + (" " + dim(right) + " " + _c("36", h) if right else "") + _c("36", tr))
+    for line in lines:
+        print(_c("36", v) + "  " + pad(line, w - 5) + " " + _c("36", v))
+    print(_c("36", bl + h * (w - 2) + br))
+
+
+def keys_hint(pairs: list[tuple[str, str]]) -> None:
+    """Подсказка по клавишам: [1-6] модуль   [u] обновить всё …, с переносом по ширине."""
+    w = term_width()
+    items = [accent(f"[{k}]") + " " + label for k, label in pairs]
+    line = " "
+    for it in items:
+        if text_width(line) + text_width(it) + 3 > w and line.strip():
+            print(line)
+            line = " "
+        line += "  " + it
+    if line.strip():
+        print(line)
+
+
+def prompt(label: str = "") -> str:
+    """Ввод с приглашением ❯. Приглашение печатаем сами: input() без readline
+    неверно считает ширину строки с ANSI-кодами."""
+    arrow = accent("❯" if FANCY else ">")
+    sys.stdout.write(f" {arrow} " + (f"{label}: " if label else ""))
+    sys.stdout.flush()
+    return input().strip()
+
+
+def pause() -> None:
+    if not sys.stdin.isatty():
+        return
+    print()
+    sys.stdout.write(dim("  Enter — назад") + " ")
+    sys.stdout.flush()
+    try:
+        input()
+    except EOFError:
+        pass
 
 
 def info(msg: str) -> None:
@@ -115,13 +269,34 @@ def info(msg: str) -> None:
         print(msg)
 
 
+def done(msg: str) -> None:
+    """Успешный итог действия: в терминале — с зелёной галочкой, иначе как info."""
+    if not QUIET:
+        print(_c("32", "✓" if FANCY else "+") + " " + msg if COLOR else msg)
+
+
 def step(msg: str) -> None:
     if not QUIET:
-        print(_c("1;36", "==> ") + msg)
+        print(accent("▸ ") + bold(msg) if COLOR else "==> " + msg)
+
+
+def _report(msg: str, icon: str, color: str) -> None:
+    if not ERR_COLOR:
+        print("[!] " + msg, file=sys.stderr)
+        return
+    w = term_width() - 4
+    lines = wrap(msg, w)
+    print(_c(color, icon, True) + " " + lines[0], file=sys.stderr)
+    for line in lines[1:]:
+        print("  " + line, file=sys.stderr)
 
 
 def warn(msg: str) -> None:
-    print(_c("1;33", "[!] ") + msg, file=sys.stderr)
+    _report(msg, "!", "1;33")
+
+
+def error(msg: str) -> None:
+    _report(msg, "✗" if FANCY else "x", "1;31")
 
 
 def ask(question: str, default: bool = True) -> bool:
@@ -129,7 +304,12 @@ def ask(question: str, default: bool = True) -> bool:
         return default
     hint = "[Д/н]" if default else "[д/Н]"
     try:
-        ans = input(f"{question} {hint} ").strip().lower()
+        if COLOR:
+            sys.stdout.write(_c("1;33", "? ") + question + " " + dim(hint) + " ")
+            sys.stdout.flush()
+            ans = input().strip().lower()
+        else:
+            ans = input(f"{question} {hint} ").strip().lower()
     except EOFError:
         return default
     if not ans:
@@ -233,6 +413,8 @@ def download(url: str, dest: Path, label: str) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    show = SCREEN and not QUIET
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=60) as resp, open(part, "wb") as f:
             total = int(resp.headers.get("Content-Length") or 0)
@@ -242,21 +424,48 @@ def download(url: str, dest: Path, label: str) -> None:
                 f.write(chunk)
                 done += len(chunk)
                 now = time.monotonic()
-                if total and sys.stdout.isatty() and not QUIET and now - last > 0.2:
+                if show and now - last > 0.1:
                     last = now
-                    print(f"\r   {label}: {done * 100 // total}% ({done >> 20} из {total >> 20} МБ)",
-                          end="", flush=True)
-        if total and sys.stdout.isatty() and not QUIET:
-            print(f"\r   {label}: 100% ({total >> 20} МБ)" + " " * 20)
+                    progress_line(label, done, total, done / max(now - started, 0.001))
+        if show:
+            secs = time.monotonic() - started
+            sys.stdout.write("\r\033[K")
+            done_line = f"{label}  {_mb(done)} МБ за {secs:.0f} с"
+            print("   " + (_c("32", "✓" if FANCY else "+") + " " + done_line if COLOR else done_line))
         if total and done != total:
             raise AioError(f"{label}: скачано {done} из {total} байт")
     except (urllib.error.URLError, TimeoutError, OSError) as e:
+        if show:
+            sys.stdout.write("\r\033[K")
         part.unlink(missing_ok=True)
         raise AioError(f"не удалось скачать {label}: {e}") from e
     except BaseException:
+        if show:
+            sys.stdout.write("\r\033[K")
         part.unlink(missing_ok=True)
         raise
     os.replace(part, dest)
+
+
+def _mb(n: float) -> str:
+    return f"{n / 1048576:.1f}"
+
+
+def progress_line(label: str, done: int, total: int, speed: float) -> None:
+    """   ███████████░░░░░░░  58%  15.9/27.3 МБ  4.2 МБ/с  имя-файла"""
+    w = term_width()
+    full, empty = ("█", "░") if FANCY else ("#", ".")
+    if total:
+        bar_w = max(10, min(28, w - 52))
+        filled = min(bar_w, done * bar_w // total)
+        bar = _c("36", full * filled) + dim(empty * (bar_w - filled))
+        stats = f" {done * 100 // total:3d}%  {_mb(done)}/{_mb(total)} МБ  {_mb(speed)} МБ/с  "
+        head = "   " + bar + stats
+    else:
+        head = f"   {_mb(done)} МБ  {_mb(speed)} МБ/с  "
+    name = clip(label, max(8, w - text_width(head) - 1))
+    sys.stdout.write("\r\033[K" + head + dim(name))
+    sys.stdout.flush()
 
 
 # --------------------------------------------------------------------------- каталог
@@ -490,7 +699,7 @@ def install(m: dict, zapret_config: Path | None = None, force: bool = False) -> 
     tag = rel.get("tag_name", "?")
     current = state.get(m["id"], {}).get("version")
     if current == tag and module_file(m).exists() and not force:
-        info(f"{m['name']}: уже последняя версия {tag}")
+        done(f"{m['name']}: уже последняя версия {tag}")
         if kind == "zapret" and zapret_config:
             zapret_import_config(zapret_config)
         return False
@@ -537,7 +746,7 @@ def remove(m: dict) -> None:
     state = load_state()
     state.pop(m["id"], None)
     save_state(state)
-    info(f"{m['name']} удалён")
+    done(f"{m['name']} удалён")
 
 
 def update_all(include_self: bool = True) -> list[str]:
@@ -561,7 +770,7 @@ def update_all(include_self: bool = True) -> list[str]:
             errors.append(f"All in One: {e}")
             warn(f"All in One: {e}")
     if not changed and not errors:
-        info("Всё уже обновлено.")
+        done("Всё уже обновлено.")
     if errors:
         raise AioError("не всё обновилось")
     return changed
@@ -679,7 +888,7 @@ def timer_set(when: str, action: str) -> None:
     if res.returncode != 0:
         raise AioError(f"не удалось поставить таймер: {res.stderr.strip()}")
     save_json(TIMER_FILE, {"at": at.isoformat(timespec="seconds"), "action": action})
-    info(f"{ACTIONS[action].capitalize()} в {at:%H:%M}" + (f" {at:%d.%m}" if at.date() != datetime.now().date() else "")
+    done(f"{ACTIONS[action].capitalize()} в {at:%H:%M}" + (f" {at:%d.%m}" if at.date() != datetime.now().date() else "")
          + ". Отмена: aio timer cancel")
 
 
@@ -690,7 +899,7 @@ def timer_cancel(quiet: bool = False) -> None:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     TIMER_FILE.unlink(missing_ok=True)
     if not quiet:
-        info("Таймер снят")
+        done("Таймер снят")
 
 
 def timer_status() -> str:
@@ -718,7 +927,7 @@ def self_update() -> bool:
     rel = latest_release(REPO)
     tag = rel.get("tag_name", "")
     if tag.lstrip("v") == VERSION:
-        info(f"All in One: уже последняя версия {VERSION}")
+        done(f"All in One: уже последняя версия {VERSION}")
         return False
     asset = pick_asset(rel, "AllInOne-*-x86_64.AppImage")
     step(f"All in One {VERSION} → {tag.lstrip('v')}")
@@ -755,7 +964,7 @@ def self_install() -> None:
                              "Модули: zapret, TG WS Proxy, TryToCatchMe, таймер выключения",
                              "System;Network;", terminal=True))
     refresh_menu()
-    info(f"All in One установлен: {target}, команда aio, ярлык в меню.")
+    done(f"All in One установлен: {target}, команда aio, ярлык в меню.")
     if str(BIN_DIR) not in os.environ.get("PATH", "").split(":"):
         warn(f"{BIN_DIR} нет в PATH — после перезахода в систему команда aio заработает (или запускай {link})")
 
@@ -774,14 +983,14 @@ def autoupdate(enable: bool) -> None:
         res = subprocess.run(["systemctl", "--user", "enable", "--now", f"{UPDATE_UNIT}.timer"], check=False)
         if res.returncode != 0:
             raise AioError("systemd не включил таймер автообновления (systemctl --user недоступен?)")
-        info("Автообновление включено: раз в день, при обновлении — уведомление.")
+        done("Автообновление включено: раз в день, при обновлении — уведомление.")
     else:
         subprocess.run(["systemctl", "--user", "disable", "--now", f"{UPDATE_UNIT}.timer"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         service.unlink(missing_ok=True)
         timer.unlink(missing_ok=True)
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-        info("Автообновление выключено.")
+        done("Автообновление выключено.")
 
 
 def autoupdate_enabled() -> bool:
@@ -812,90 +1021,280 @@ def module_status(m: dict) -> str:
     return " · ".join(parts)
 
 
+def module_row(m: dict) -> tuple[str, str, str]:
+    """Строка таблицы модулей: (тон значка, версия, состояние)."""
+    spec = linux_spec(m)
+    if spec is None:
+        return "na", "", "нет версии для Linux"
+    kind = spec.get("kind")
+    if kind == "builtin:shutdown-timer":
+        t = timer_status()
+        return ("warn" if t != "не запущен" else "builtin"), "встроен", f"таймер: {t}"
+    st = load_state().get(m["id"])
+    if not st or not module_file(m).exists():
+        return "off", "", "не установлен"
+    version = st.get("version", "?")
+    if kind == "zapret":
+        s = zapret_status()
+        if not s:
+            return "idle", version, "установлен"
+        tone = {"служба работает": "run"}.get(s, "bad" if s.startswith("служба упала") else "warn")
+        return tone, version, s
+    running = bool(pids_of(module_file(m)))
+    parts = ["запущен" if running else "не запущен"]
+    if spec.get("autostart"):
+        parts.append("автозапуск" if st.get("autostart", True) else "без автозапуска")
+    return ("run" if running else "idle"), version, " · ".join(parts)
+
+
+def module_table(mods: list[dict], numbered: bool = True) -> None:
+    """Таблица модулей по категориям: значок, имя, версия, состояние — в ровных колонках."""
+    w = term_width()
+    rows = [(i, m, *module_row(m)) for i, m in enumerate(mods, 1)]
+    name_w = max(text_width(m["name"]) for m in mods)
+    ver_w = min(22, max([text_width(r[3]) for r in rows] + [6]))
+    num_w = len(str(len(mods))) + 2 if numbered else 0
+    lead = 2 + num_w + 2                          # отступ, номер, значок
+    state_w = max(12, w - lead - name_w - ver_w - 4)
+    print("  " + " " * num_w + "  " + dim(pad("Модуль", name_w) + "  " + pad("Версия", ver_w) + "  Состояние"))
+    category = None
+    used = set()
+    for i, m, tone, ver, state in rows:
+        cat = m.get("category") or "Прочее"
+        if cat != category:
+            category = cat
+            label = f" {cat} "
+            print("  " + _c("1;34", cat.upper()) + " " + rule(max(4, w - 3 - text_width(label))))
+        used.add(tone)
+        num = accent(f"{i:>{num_w - 2}}") + "  " if numbered else ""
+        name = pad(m["name"], name_w)
+        version = pad(clip(ver, ver_w) if ver else ("—" if FANCY else "-"), ver_w)
+        state_txt = clip(state, state_w)
+        colored = {"run": _c("32", state_txt), "warn": _c("33", state_txt), "bad": _c("31", state_txt),
+                   "off": dim(state_txt), "na": dim(state_txt)}.get(tone, state_txt)
+        if tone in ("na", "off"):
+            name, version = dim(name), dim(version)
+        else:
+            name = bold(name)
+        print(f"  {num}{glyph(tone)} {name}  {version}  {colored}")
+    legend = [f"{glyph(t)} {LEGEND[t]}" for t in LEGEND if t in used]
+    if legend:
+        print()
+        print("  " + dim("   ").join(legend))
+
+
 def print_status() -> None:
-    width = max(len(m["name"]) for m in catalog())
-    for m in catalog():
-        print(f"  {m['name']:<{width}}  {module_status(m)}")
+    if not COLOR:
+        width = max(len(m["name"]) for m in catalog())
+        for m in catalog():
+            print(f"  {m['name']:<{width}}  {module_status(m)}")
+        return
+    box("All in One for Linux", [dim("Модули из каталога All in One")], f"v{VERSION}")
+    print()
+    module_table(catalog(), numbered=False)
 
 
 # --------------------------------------------------------------------------- меню
 
+CANCELLED = object()   # действие отменено пользователем — не нужно ждать Enter
+
+
+def run_action(fn, wait: bool = True) -> None:
+    """Выполняет пункт меню: ошибки показываем аккуратно, а не трассировкой."""
+    print()
+    try:
+        if fn() is CANCELLED:
+            return
+    except AioError as e:
+        error(str(e))
+    except KeyboardInterrupt:
+        print()
+        warn("прервано")
+    else:
+        if not wait:
+            return
+    pause()
+
+
+def main_screen(mods: list[dict], flash: str) -> None:
+    clear_screen()
+    auto = autoupdate_enabled()
+    box("All in One for Linux", [
+        "Модули из каталога All in One: установка, обновление, запуск.",
+        dim("Автообновление: ") + (_c("32", "включено, раз в день") if auto else _c("33", "выключено")),
+    ], f"v{VERSION}")
+    print()
+    module_table(mods)
+    print()
+    print(" " + rule(term_width() - 2))
+    keys_hint([(f"1-{len(mods)}", "модуль"), ("u", "обновить всё"),
+               ("a", "выключить автообновление" if auto else "включить автообновление"), ("q", "выход")])
+    if flash:
+        print()
+        print("  " + flash)
+    print()
+
+
 def menu() -> None:
+    try:
+        if SCREEN:
+            clear_screen()
+            print(dim("Загружаю каталог модулей…"))
+        _menu_loop()
+    finally:
+        leave_screen()
+
+
+def _menu_loop() -> None:
+    flash = ""
     while True:
         mods = catalog()
-        print()
-        print(_c("1", f"All in One for Linux {VERSION}"))
-        width = max(len(m["name"]) for m in mods)
-        for i, m in enumerate(mods, 1):
-            st = module_status(m)
-            dim = linux_spec(m) is None
-            line = f"  {i}. {m['name']:<{width}}  {st}"
-            print(_c("2", line) if dim else line)
-        print()
-        print("  номер — модуль · u — обновить всё · a — автообновление "
-              f"({'вкл' if autoupdate_enabled() else 'выкл'}) · q — выход")
+        main_screen(mods, flash)
+        flash = ""
         try:
-            choice = input("> ").strip().lower()
+            choice = prompt().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             return
-        try:
-            if choice in ("q", "й", "exit", ""):
-                return
-            if choice in ("u", "г"):
-                update_all()
-            elif choice in ("a", "ф"):
-                autoupdate(not autoupdate_enabled())
-            elif choice.isdigit() and 1 <= int(choice) <= len(mods):
+        if choice in ("q", "й", "exit", ""):
+            return
+        if choice in ("u", "г"):
+            run_action(update_all)
+        elif choice in ("a", "ф"):
+            run_action(lambda: autoupdate(not autoupdate_enabled()), wait=False)
+        elif choice.isdigit() and 1 <= int(choice) <= len(mods):
+            try:
                 module_menu(mods[int(choice) - 1])
-        except AioError as e:
-            warn(str(e))
-        except KeyboardInterrupt:
-            print()
+            except (EOFError, KeyboardInterrupt):
+                pass
+        else:
+            flash = _c("33", f"Нет такого пункта: {choice}. Введи номер модуля или букву из подсказки.")
+
+
+def module_screen(m: dict, flash: str = "") -> None:
+    clear_screen()
+    spec = linux_spec(m) or {}
+    w = term_width() - 6
+    lines = wrap(description(m), w)
+    src = spec.get("homepage") or (f"https://github.com/{spec['source']['repo']}"
+                                   if (spec.get("source") or {}).get("repo") else "")
+    if src:
+        lines.append(dim(clip(src, w)))
+    box(m["name"], lines, m.get("category", ""))
+    print()
+    tone, ver, state = module_row(m)
+    print(f"  {dim(pad('Состояние', 10))} {glyph(tone)} {state}")
+    if ver and tone not in ("na", "off"):
+        print(f"  {dim(pad('Версия', 10))}   {ver}")
+    if spec and tone not in ("na", "off") and spec.get("kind") != "builtin:shutdown-timer":
+        path = str(module_file(m)).replace(str(HOME), "~", 1)
+        print(f"  {dim(pad('Файл', 10))}   {dim(clip(path, w - 10))}")
+    print()
+    if flash:
+        print("  " + flash)
+        print()
 
 
 def module_menu(m: dict) -> None:
     spec = linux_spec(m)
-    print()
-    print(_c("1", m["name"]) + f" — {description(m)}")
     if spec is None:
-        print("  Под Linux этого модуля нет.")
+        module_screen(m)
+        print("  " + _c("33", "Под Linux этого модуля нет."))
+        pause()
         return
-    kind = spec.get("kind")
-    if kind == "builtin:shutdown-timer":
-        print(f"  Сейчас: {timer_status()}")
-        when = input("  Когда (23:30, 45m, 1h30m; пусто — отмена таймера): ").strip()
-        if not when:
-            timer_cancel()
-            return
-        action = input("  Что сделать (poweroff/reboot/suspend) [poweroff]: ").strip() or "poweroff"
-        timer_set(when, action)
+    if spec.get("kind") == "builtin:shutdown-timer":
+        timer_menu(m)
         return
 
-    installed = is_installed(m)
-    opts = []
-    if not installed:
-        opts.append(("Установить", lambda: install(m)))
-    else:
-        opts.append(("Проверить обновление", lambda: install(m)))
-        if kind == "zapret":
-            opts.append(("Настроить (стратегия, служба)", zapret_tui))
+    kind = spec.get("kind")
+    flash = ""
+    while True:
+        installed = is_installed(m)
+        # (подпись, действие, ждать Enter после вывода)
+        opts = []
+        if not installed:
+            opts.append(("Установить", lambda: install(m), True))
         else:
-            path = module_file(m)
-            if pids_of(path):
-                opts.append(("Остановить", lambda: stop_pids(pids_of(path))))
+            opts.append(("Проверить обновление", lambda: install(m), True))
+            if kind == "zapret":
+                opts.append(("Настроить (стратегия, служба)", zapret_tui, False))
             else:
-                opts.append(("Запустить", lambda: launch(path, spec.get("args"))))
-            if spec.get("autostart"):
-                on = load_state().get(m["id"], {}).get("autostart", True)
-                opts.append(("Выключить автозапуск" if on else "Включить автозапуск",
-                             lambda: set_autostart(m, not on)))
-        opts.append(("Удалить", lambda: remove(m) if ask(f"Удалить {m['name']}?", False) else None))
-    for i, (label, _) in enumerate(opts, 1):
-        print(f"  {i}. {label}")
-    choice = input("> ").strip()
-    if choice.isdigit() and 1 <= int(choice) <= len(opts):
-        opts[int(choice) - 1][1]()
+                path = module_file(m)
+                if pids_of(path):
+                    opts.append(("Остановить", lambda: stop_pids(pids_of(path)), False))
+                else:
+                    opts.append(("Запустить", lambda: launch(path, spec.get("args")), False))
+                if spec.get("autostart"):
+                    on = load_state().get(m["id"], {}).get("autostart", True)
+                    opts.append(("Выключить автозапуск" if on else "Включить автозапуск",
+                                 lambda: set_autostart(m, not on), False))
+            opts.append(("Удалить", lambda: remove(m) if ask(f"Удалить {m['name']}?", False) else CANCELLED,
+                         True))
+
+        module_screen(m, flash)
+        flash = ""
+        for i, (label, _, _) in enumerate(opts, 1):
+            print(f"   {accent(f'[{i}]')} {_c('31', label) if label == 'Удалить' else label}")
+        print(f"   {accent('[0]')} {dim('Назад')}")
+        print()
+        choice = prompt()
+        if choice in ("", "0", "q", "й"):
+            return
+        if not (choice.isdigit() and 1 <= int(choice) <= len(opts)):
+            flash = _c("33", f"Нет такого пункта: {choice}")
+            continue
+        label, fn, wait = opts[int(choice) - 1]
+        if wait:
+            run_action(fn)
+        else:
+            try:
+                fn()
+                if label in ("Запустить", "Остановить"):
+                    flash = _c("32", f"{m['name']}: {'запущен' if label == 'Запустить' else 'остановлен'}")
+            except AioError as e:
+                print()
+                error(str(e))
+                pause()
+        if label == "Удалить" and not is_installed(m):
+            return
+
+
+def timer_menu(m: dict) -> None:
+    flash = ""
+    while True:
+        module_screen(m, flash)
+        flash = ""
+        active = timer_status() != "не запущен"
+        print("  " + dim("Когда сработать:"))
+        examples = [(["23:30"], "в это время (сегодня или завтра)"),
+                    (["45m", "1h30m", "90"], "через интервал (минуты без буквы)")]
+        for ex, what in examples:
+            print("     " + pad("  ".join(accent(e) for e in ex), 18) + dim(what))
+        print()
+        keys_hint(([("x", "снять таймер")] if active else []) + [("Enter", "назад")])
+        print()
+        when = prompt("когда")
+        if not when:
+            return
+        if when.lower() in ("x", "ч", "cancel", "отмена"):
+            timer_cancel(quiet=True)
+            flash = _c("32", "Таймер снят")
+            continue
+        try:
+            at = parse_when(when)
+        except AioError as e:
+            flash = _c("33", str(e))
+            continue
+        print()
+        print("  " + dim(f"Что сделать в {at:%H:%M}:"))
+        actions = list(ACTIONS)
+        for i, a in enumerate(actions, 1):
+            print(f"     {accent(f'[{i}]')} {ACTIONS[a]}" + (dim("  (Enter)") if i == 1 else ""))
+        print()
+        action = prompt("действие")
+        if action.isdigit() and 1 <= int(action) <= len(actions):
+            action = actions[int(action) - 1]
+        run_action(lambda: timer_set(when, action or "poweroff"))
 
 
 def set_autostart(m: dict, on: bool) -> None:
@@ -906,7 +1305,7 @@ def set_autostart(m: dict, on: bool) -> None:
         app_launchers(m, module_file(m))
     else:
         (AUTOSTART_DIR / f"allinone-{m['id']}.desktop").unlink(missing_ok=True)
-    info(f"Автозапуск {m['name']} {'включён' if on else 'выключен'}")
+    done(f"Автозапуск {m['name']} {'включён' if on else 'выключен'}")
 
 
 # --------------------------------------------------------------------------- командная строка
