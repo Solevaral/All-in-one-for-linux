@@ -1,0 +1,27 @@
+#!/bin/sh
+# Точка входа AppImage. Сам All in One — aio.py на Python 3 из системы
+# (есть почти в любом дистрибутиве, в Arch/CachyOS — пакет python).
+HERE="$(dirname "$(readlink -f "$0")")"
+AIO="$HERE/usr/share/allinone/aio.py"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    msg="All in One: нужен Python 3 (пакет python или python3)."
+    echo "$msg" >&2
+    command -v notify-send >/dev/null 2>&1 && notify-send "All in One" "$msg"
+    exit 1
+fi
+
+# Запуск двойным щелчком из файлового менеджера: терминала нет, а All in One —
+# программа для терминала. Открываем её в первом найденном эмуляторе терминала.
+if [ $# -eq 0 ] && [ ! -t 0 ] && [ -z "$AIO_NO_TERMINAL" ] && [ -n "$APPIMAGE" ]; then
+    export AIO_NO_TERMINAL=1
+    for t in konsole gnome-terminal kgx xfce4-terminal alacritty kitty foot xterm x-terminal-emulator; do
+        command -v "$t" >/dev/null 2>&1 || continue
+        case "$t" in
+            gnome-terminal|kgx) exec "$t" -- "$APPIMAGE" ;;
+            *) exec "$t" -e "$APPIMAGE" ;;
+        esac
+    done
+fi
+
+exec python3 "$AIO" "$@"

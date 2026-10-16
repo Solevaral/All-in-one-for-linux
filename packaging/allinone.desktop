@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=All in One
+Comment=Модули: zapret, TG WS Proxy, TryToCatchMe, таймер выключения
+Exec=aio
+Icon=allinone
+Categories=System;Network;
+Terminal=true

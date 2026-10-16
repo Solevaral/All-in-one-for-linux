@@ -1,0 +1,25 @@
+# Maintainer: Solevaral
+# Шаблон: CI подставляет @VERSION@ и @SHA256@ и кладёт готовый PKGBUILD в релиз.
+pkgname=allinone-linux
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="All in One for Linux: zapret, TG WS Proxy, TryToCatchMe и таймер выключения из одного каталога"
+arch=('any')
+url="https://github.com/Solevaral/All-in-one-for-linux"
+license=('MIT')
+depends=('python')
+optdepends=('libnotify: уведомления автообновления'
+            'nftables: для zapret'
+            'fuse2: для запуска TryToCatchMe (AppImage)')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('@SHA256@')
+
+package() {
+    cd "All-in-one-for-linux-$pkgver"
+    install -Dm755 aio.py "$pkgdir/usr/lib/allinone/aio.py"
+    install -d "$pkgdir/usr/bin"
+    ln -s /usr/lib/allinone/aio.py "$pkgdir/usr/bin/aio"
+    install -Dm644 packaging/allinone.desktop "$pkgdir/usr/share/applications/allinone.desktop"
+    install -Dm644 packaging/allinone.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/allinone.png"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: python3 -m unittest discover -s tests -v
+
+      - name: AppImage
+        run: bash build-appimage.sh "${{ github.ref_name }}"
+
+      - name: Smoke test
+        run: |
+          app=$(ls dist/AllInOne-*-x86_64.AppImage)
+          "$app" --appimage-extract-and-run --version
+
+      # PKGBUILD для AUR с контрольной суммой архива этого тега.
+      - name: PKGBUILD
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          curl -fsSL -o src.tar.gz "https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sum=$(sha256sum src.tar.gz | cut -d' ' -f1)
+          sed -e "s/@VERSION@/$ver/" -e "s/@SHA256@/$sum/" packaging/aur/PKGBUILD.in > dist/PKGBUILD
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "All in One for Linux ${{ github.ref_name }}"
+          body: |
+            **AllInOne-*-x86_64.AppImage** — скачать, сделать исполняемым и запустить:
+            ```
+            chmod +x AllInOne-*-x86_64.AppImage
+            ./AllInOne-*-x86_64.AppImage self-install
+            ```
+            После этого — команда `aio` и ярлык «All in One» в меню. Нужен Python 3.
+
+            **PKGBUILD** — пакет для Arch / CachyOS (`makepkg -si` в папке с файлом).
+          files: |
+            dist/AllInOne-*-x86_64.AppImage
+            dist/PKGBUILD
